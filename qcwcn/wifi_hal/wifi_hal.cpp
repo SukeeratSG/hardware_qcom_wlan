@@ -583,6 +583,7 @@ wifi_error init_wifi_vendor_hal_func_table(wifi_hal_fn *fn) {
 #ifdef WCNSS_QTI_AOSP
     fn->wifi_set_latency_mode = wifi_set_latency_mode;
 #endif
+    fn->wifi_set_thermal_mitigation_mode = wifi_set_thermal_mitigation_mode;
 
     return WIFI_SUCCESS;
 }
@@ -1315,6 +1316,12 @@ static int register_monitor_sock(wifi_handle handle, wifihal_ctrl_req_t *ctrl_ms
 
     if(attach)
     {
+       if (ctrl_msg->monsock_len > sizeof(struct sockaddr_un))
+       {
+         ALOGE("%s: Invalid monitor socket length \n", __FUNCTION__);
+         return -3;
+       }
+
        nreg = (wifihal_mon_sock_t *)malloc(sizeof(*reg) + match_len);
         if (!nreg)
            return -1;
