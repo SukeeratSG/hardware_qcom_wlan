@@ -40,8 +40,38 @@
 #define UNUSED(x)	(void)(x)
 #define NL80211_ATTR_MAX_INTERNAL 256
 
-
 /* ============ nl80211 driver extensions ===========  */
+static int wpa_driver_cmd_set_ani_level(struct i802_bss *bss, int mode, int ofdmlvl)
+{
+	struct wpa_driver_nl80211_data *drv = bss->drv;
+	struct nl_msg *msg = NULL;
+	struct nlattr *params = NULL;
+	int ret = 0;
+
+	if (!(msg = nl80211_drv_msg(drv, 0, NL80211_CMD_VENDOR)) ||
+		nla_put_u32(msg, NL80211_ATTR_VENDOR_ID, OUI_QCA) ||
+		nla_put_u32(msg, NL80211_ATTR_VENDOR_SUBCMD,
+			QCA_NL80211_VENDOR_SUBCMD_SET_WIFI_CONFIGURATION) ||
+		!(params = nla_nest_start(msg, NL80211_ATTR_VENDOR_DATA)) ||
+		nla_put_u8(msg, QCA_WLAN_VENDOR_ATTR_CONFIG_ANI_SETTING, mode)) {
+			nlmsg_free(msg);
+			return -1;
+	}
+	if(mode == QCA_WLAN_ANI_SETTING_FIXED) {
+		if(nla_put(msg, QCA_WLAN_VENDOR_ATTR_CONFIG_ANI_LEVEL, sizeof(int32_t), &ofdmlvl)){
+			nlmsg_free(msg);
+			return -1;
+		}
+	}
+	nla_nest_end(msg, params);
+	ret = send_and_recv_msgs(drv, msg, NULL, NULL);
+	if (!ret)
+		return 0;
+	wpa_printf(MSG_ERROR, "%s: Failed set_ani_level, ofdmlvl=%d, ret=%d",
+		   __FUNCTION__, ofdmlvl, ret);
+	return ret;
+}
+
 static int wpa_driver_cmd_set_tx_power(struct i802_bss *bss, char *cmd)
 {
 	struct wpa_driver_nl80211_data *drv = bss->drv;
@@ -179,6 +209,7 @@ static int parse_station_info(struct resp_info *info, struct nlattr *vendata,
 	struct nlattr *attr, *attr1, *attr2;
 	u8 *beacon_ies = NULL;
 	size_t beacon_ies_len = 0;
+	u8 seg0, seg1;
 
 	os_memset(&data, 0, sizeof(struct bss_info));
 
@@ -299,7 +330,15 @@ static int parse_station_info(struct resp_info *info, struct nlattr *vendata,
 			}
 			break;
 		case CHANWIDTH_80MHZ:
-			data.bw = 80;
+			seg0 = info->vht_op_info_chan_center_freq_seg0_idx;
+			seg1 = info->vht_op_info_chan_center_freq_seg1_idx;
+			if (seg1 && abs(seg1 - seg0) == 8)
+				data.bw = 160;
+			else if (seg1)
+				/* Notifying 80P80 as bandwidth = 160 */
+				data.bw = 160;
+			else
+				data.bw = 80;
 			break;
 		case CHANWIDTH_160MHZ:
 			data.bw = 160;
@@ -569,6 +608,90 @@ static int convert_string_to_bytes(u8 *addr, const char *text, u16 max_bytes)
 	return i;
 }
 
+/*
+ * Client can send the cell switch mode in below format
+ *
+ * SETCELLSWITCHMODE <cs mode>
+ *
+ * examples:
+ * For Default Mode   - "SETCELLSWITCHMODE 0"
+ * To Disable Roaming - "SETCELLSWITCHMODE 1"
+ * For Partial Scan   - "SETCELLSWITCHMODE 2"
+ */
+static int parse_and_populate_setcellswitchmode(struct nl_msg *nlmsg,
+						    char *cmd)
+{
+	uint32_t all_trigger_bitmap, scan_scheme_bitmap;
+	uint32_t cellswm;
+	struct nlattr *config;
+
+	cellswm = atoi(cmd);
+	if (cellswm < 0 || cellswm > 2) {
+		wpa_printf(MSG_ERROR,"Invalid cell switch mode: %d", cellswm);
+		return -1;
+	}
+	wpa_printf(MSG_DEBUG, "cell switch mode: %d", cellswm);
+
+	all_trigger_bitmap = QCA_ROAM_TRIGGER_REASON_PER |
+			     QCA_ROAM_TRIGGER_REASON_BEACON_MISS |
+			     QCA_ROAM_TRIGGER_REASON_POOR_RSSI |
+			     QCA_ROAM_TRIGGER_REASON_BETTER_RSSI |
+			     QCA_ROAM_TRIGGER_REASON_PERIODIC |
+			     QCA_ROAM_TRIGGER_REASON_DENSE |
+			     QCA_ROAM_TRIGGER_REASON_BTM |
+			     QCA_ROAM_TRIGGER_REASON_BSS_LOAD |
+			     QCA_ROAM_TRIGGER_REASON_USER_TRIGGER_TMP |
+			     QCA_ROAM_TRIGGER_REASON_DEAUTH_TMP |
+			     QCA_ROAM_TRIGGER_REASON_IDLE_TMP |
+			     QCA_ROAM_TRIGGER_REASON_TX_FAILURES_TMP |
+			     QCA_ROAM_TRIGGER_REASON_EXTERNAL_SCAN_TMP;
+
+	scan_scheme_bitmap = QCA_ROAM_TRIGGER_REASON_PER |
+			     QCA_ROAM_TRIGGER_REASON_BEACON_MISS |
+			     QCA_ROAM_TRIGGER_REASON_POOR_RSSI |
+			     QCA_ROAM_TRIGGER_REASON_BSS_LOAD |
+			     QCA_ROAM_TRIGGER_REASON_BTM;
+
+	if (nla_put_u32(nlmsg, QCA_WLAN_VENDOR_ATTR_ROAMING_SUBCMD,
+		QCA_WLAN_VENDOR_ROAMING_SUBCMD_CONTROL_SET) ||
+	    nla_put_u32(nlmsg, QCA_WLAN_VENDOR_ATTR_ROAMING_REQ_ID, 1)) {
+		wpa_printf(MSG_ERROR,"Failed to put: roam_subcmd/REQ_ID");
+	}
+
+	config = nla_nest_start(nlmsg,
+			QCA_WLAN_VENDOR_ATTR_ROAMING_PARAM_CONTROL);
+	if (config == NULL)
+		goto fail;
+
+	switch (cellswm){
+	case 0:
+		if (nla_put_u32(nlmsg, QCA_ATTR_ROAM_CONTROL_TRIGGERS, all_trigger_bitmap)) {
+			wpa_printf(MSG_ERROR,"Failed to set: ROAM_CONTROL_TRIGGERS");
+			goto fail;
+		}
+		break;
+	case 1:
+		if (nla_put_u32(nlmsg, QCA_ATTR_ROAM_CONTROL_TRIGGERS, 0)) {
+			wpa_printf(MSG_ERROR,"Failed to unset: ROAM_CONTROL_TRIGGERS");
+			goto fail;
+		}
+		break;
+	case 2:
+		if (nla_put_u32(nlmsg, QCA_ATTR_ROAM_CONTROL_TRIGGERS, all_trigger_bitmap) ||
+		    nla_put_u32(nlmsg, QCA_ATTR_ROAM_CONTROL_SCAN_SCHEME_TRIGGERS_TMP, scan_scheme_bitmap)) {
+			wpa_printf(MSG_ERROR,"Failed to set: ROAM_CONTROL_TRIGGERS_SCAN_SCHEME");
+			goto fail;
+		}
+		break;
+	}
+	nla_nest_end(nlmsg, config);
+
+	return 0;
+fail:
+	return -1;
+
+}
+
 static int populate_nlmsg(struct nl_msg *nlmsg, char *cmd,
 			  enum get_info_cmd type)
 {
@@ -583,6 +706,12 @@ static int populate_nlmsg(struct nl_msg *nlmsg, char *cmd,
 		if (nla_put_flag(nlmsg,
 				 QCA_WLAN_VENDOR_ATTR_GET_STATION_INFO)) {
 			wpa_printf(MSG_ERROR,"Failed to put flag QCA_WLAN_VENDOR_ATTR_GET_STATION_INFO");
+			return -1;
+		}
+		break;
+	case SETCELLSWITCHMODE:
+		if (parse_and_populate_setcellswitchmode(nlmsg, cmd) != 0) {
+			wpa_printf(MSG_ERROR, "Failed to populate nlmsg");
 			return -1;
 		}
 		break;
@@ -1051,6 +1180,62 @@ static int wpa_driver_handle_get_sta_info(struct i802_bss *bss, char *cmd,
 	return wpa_driver_get_all_sta_info(bss, buf, buf_len, status);
 }
 
+static int thermal_info_handler(struct nl_msg *msg, void *arg)
+{
+	struct nlattr *tb[NL80211_ATTR_MAX + 1];
+	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+	int *param = arg;
+	struct nlattr *nl_vendor;
+	struct nlattr *tb_vendor[QCA_WLAN_VENDOR_ATTR_MAX + 1];
+
+	nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
+	    genlmsg_attrlen(gnlh, 0), NULL);
+
+	nl_vendor = tb[NL80211_ATTR_VENDOR_DATA];
+	if (!nl_vendor || nla_parse(tb_vendor, QCA_WLAN_VENDOR_ATTR_MAX,
+	    nla_data(nl_vendor), nla_len(nl_vendor), NULL)) {
+		wpa_printf(MSG_ERROR, "%s: No vendor data found", __func__);
+		return NL_SKIP;
+	}
+
+	if (tb_vendor[QCA_WLAN_VENDOR_ATTR_THERMAL_GET_TEMPERATURE_DATA])
+		*param = (int) nla_get_u32(
+		    tb_vendor[QCA_WLAN_VENDOR_ATTR_THERMAL_GET_TEMPERATURE_DATA]);
+	else if (tb_vendor[QCA_WLAN_VENDOR_ATTR_THERMAL_LEVEL])
+		*param = (int) nla_get_u32(
+		    tb_vendor[QCA_WLAN_VENDOR_ATTR_THERMAL_LEVEL]);
+	else
+		wpa_printf(MSG_ERROR, "%s: failed to parse data", __func__);
+
+	return NL_SKIP;
+}
+
+static int wpa_driver_cmd_get_thermal_info(struct i802_bss *bss, int *result, int attr)
+{
+	struct wpa_driver_nl80211_data *drv = bss->drv;
+	struct nl_msg *msg = NULL;
+	struct nlattr *params = NULL;
+	int ret = 0;
+
+	if (!(msg = nl80211_drv_msg(drv, 0, NL80211_CMD_VENDOR)) ||
+	    nla_put_u32(msg, NL80211_ATTR_VENDOR_ID, OUI_QCA) ||
+	    nla_put_u32(msg, NL80211_ATTR_VENDOR_SUBCMD,
+			QCA_NL80211_VENDOR_SUBCMD_THERMAL_CMD) ||
+	    !(params = nla_nest_start(msg, NL80211_ATTR_VENDOR_DATA)) ||
+	    nla_put_u32(msg, QCA_WLAN_VENDOR_ATTR_THERMAL_CMD_VALUE, attr)) {
+		nlmsg_free(msg);
+		return -1;
+	}
+
+	nla_nest_end(msg, params);
+	ret = send_and_recv_msgs(drv, msg, thermal_info_handler, result);
+	if (!ret)
+		return 0;
+	wpa_printf(MSG_ERROR, "%s: Failed get thermal info, ret=%d(%s)",
+				__func__, ret, strerror(-ret));
+	return ret;
+}
+
 int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
 				  size_t buf_len )
 {
@@ -1152,6 +1337,67 @@ int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
 		cmd += 15;
 		return wpa_driver_handle_get_sta_info(bss, cmd, buf, buf_len,
 						      &status);
+	} else if (os_strncasecmp(cmd, "SETCELLSWITCHMODE", 17) == 0) {
+		cmd += 17;
+		struct resp_info info;
+		struct nl_msg *nlmsg;
+
+		memset(&info, 0, sizeof(struct resp_info));
+
+		info.subcmd = QCA_NL80211_VENDOR_SUBCMD_ROAM;
+		info.cmd_type = SETCELLSWITCHMODE;
+
+		nlmsg = prepare_vendor_nlmsg(drv, bss->ifname,
+					     info.subcmd);
+		if (!nlmsg) {
+			wpa_printf(MSG_ERROR,"Failed to allocate nl message");
+			return WPA_DRIVER_OEM_STATUS_FAILURE;
+		}
+
+		if (populate_nlmsg(nlmsg, cmd, info.cmd_type)) {
+			wpa_printf(MSG_ERROR,"Failed to populate nl message");
+			nlmsg_free(nlmsg);
+			return WPA_DRIVER_OEM_STATUS_FAILURE;
+		}
+
+		status = send_nlmsg((struct nl_sock *)drv->global->nl, nlmsg,
+				     NULL, NULL);
+		if (status != 0) {
+			wpa_printf(MSG_ERROR,"Failed to send nl message with err %d", status);
+			return WPA_DRIVER_OEM_STATUS_FAILURE;
+		}
+
+		return WPA_DRIVER_OEM_STATUS_SUCCESS;
+	} else if (os_strncasecmp(cmd, "SET_ANI_LEVEL ", 14) == 0) {
+		char *endptr = NULL;
+		int mode = 0;
+		int ofdmlvl = 0;
+		mode = strtol(cmd + 14, &endptr, 10);
+		if (mode == 1) {
+			if(!(*endptr)) {
+				wpa_printf(MSG_ERROR, "%s: failed to set ani setting,\
+			          invalid cmd: %s\n", __func__, cmd);
+				return -EINVAL;
+			}
+			ofdmlvl = strtol(endptr, NULL, 10);
+		}
+		return wpa_driver_cmd_set_ani_level(priv, mode, ofdmlvl);
+	} else if (os_strncasecmp(cmd, "GET_THERMAL_INFO", 16) == 0) {
+		int temperature = -1;
+		int thermal_state = -1;
+		int ret, ret2;
+
+		ret = wpa_driver_cmd_get_thermal_info(priv, &temperature,
+		    QCA_WLAN_VENDOR_ATTR_THERMAL_CMD_TYPE_GET_TEMPERATURE);
+		if (ret)
+			return -1;
+		ret2 = wpa_driver_cmd_get_thermal_info(priv, &thermal_state,
+		    QCA_WLAN_VENDOR_ATTR_THERMAL_CMD_TYPE_GET_LEVEL);
+		if (ret2)
+			return -1;
+
+		snprintf(buf, buf_len, "%d %d", temperature, thermal_state);
+		return strlen(buf);
 	} else { /* Use private command */
 		memset(&ifr, 0, sizeof(ifr));
 		memset(&priv_cmd, 0, sizeof(priv_cmd));

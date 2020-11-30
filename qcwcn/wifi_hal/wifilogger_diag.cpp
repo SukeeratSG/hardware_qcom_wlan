@@ -791,6 +791,10 @@ wifi_error process_firmware_prints(hal_info *info, u8 *buf, u16 length)
         info->on_ring_buffer_data) {
         /* Write header and payload separately to avoid
          * complete payload memcpy */
+        if (sizeof(wifi_ring_buffer_entry) + length > 2000) {
+            ALOGE("Invalid length of buffer wifi_ring_buffer_entry size: %zu length %u ",sizeof(wifi_ring_buffer_entry), length);
+            return WIFI_ERROR_UNKNOWN;
+        }
         status = ring_buffer_write(&info->rb_infos[FIRMWARE_PRINTS_RB_ID],
                                    (u8*)&rb_entry_hdr,
                                    sizeof(wifi_ring_buffer_entry),
@@ -2824,17 +2828,17 @@ wifi_error diag_message_handler(hal_info *info, nl_msg *msg)
             u32 length = 0;
 
             slot = (dbglog_slot *)buf;
+            length = get_le32((u8 *)&slot->length);
             if (nlh->nlmsg_len < (NLMSG_HDRLEN + sizeof(dbglog_slot) +
-                                        slot->length)) {
+                                        length)) {
                 ALOGE("Received CNSS_DIAG message with insufficent length: %d:"
                               " expected: %zu, %s:%d",
                       nlh->nlmsg_len,
-                      (NLMSG_HDRLEN + sizeof(dbglog_slot) +slot->length),
+                      (NLMSG_HDRLEN + sizeof(dbglog_slot) +length),
                       __FUNCTION__,
                       __LINE__);
                 return WIFI_ERROR_UNKNOWN;
             }
-            length = get_le32((u8 *)&slot->length);
             process_fw_diag_msg(info, &slot->payload[0], length);
         }
     }
